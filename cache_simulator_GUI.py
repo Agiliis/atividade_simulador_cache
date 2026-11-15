@@ -197,6 +197,28 @@ def simulacao_monte_carlo(n_simulacoes: int, acessos: int, memory_size: int, cac
     print(f"--- Bloco: {bloco_tamanho} Bytes | Hit Rate Médio: {np.mean(taxas_acerto):.4f} | Std: {np.std(taxas_acerto):.4f} ---")
     return float(np.mean(taxas_acerto))
 
+def calcular_amat(hit_rate: float, t_hit: float, miss_penalty: float) -> float:
+    """
+    Calcula o AMAT (Average Memory Access Time - Tempo Médio de Acesso à Memória).
+
+        AMAT = t_hit + (1 - hit_rate) * miss_penalty
+
+    - t_hit: tempo (ciclos) para acessar a cache; é pago em TODO acesso,
+      seja hit ou miss (a cache sempre é consultada primeiro).
+    - (1 - hit_rate): taxa de falhas (miss rate).
+    - miss_penalty: ciclos extras para buscar o bloco no nível inferior
+      (memória principal) quando ocorre um miss.
+
+    Ciclos totais estimados de uma execução = acessos * AMAT.
+
+    Observação: o AMAT é uma função LINEAR (afim) do hit rate. Por isso,
+    calcular o AMAT a partir do hit rate MÉDIO do Monte Carlo dá exatamente
+    o mesmo resultado que calcular o AMAT de cada simulação e tirar a média:
+        média(t_hit + (1 - h_i) * P) = t_hit + (1 - média(h_i)) * P
+    Assim, não é preciso alterar simulacao_monte_carlo() para obter o AMAT.
+    """
+    return t_hit + (1.0 - hit_rate) * miss_penalty
+
 class CustomTkRedirector:
     def __init__(self, textbox: ctk.CTkTextbox):
         self.textbox = textbox
@@ -236,6 +258,7 @@ class CacheSimulatorApp(ctk.CTk):
         self.algoritmo_escolhido = "FIFO"
         self.resultados = []
         self.plot_lines = []
+        self.amat_lines = []  # Curvas de AMAT (eixo secundário), paralelas a plot_lines
         self.is_running = True
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -289,6 +312,11 @@ class CacheSimulatorApp(ctk.CTk):
         self.combo_algo = ctk.CTkComboBox(self.sidebar, values=["FIFO", "LRU", "LFU", "Random", "LRFU (adicional)"], command=self._selecionar_algoritmo)
         self.combo_algo.set("FIFO")
         self.combo_algo.pack(fill="x", pady=(0, 10))
+
+        # Modelo de Latência (AMAT) - Atividade 10
+        ctk.CTkLabel(self.sidebar, text="Modelo de Latência (AMAT)", font=ctk.CTkFont(size=12, weight="bold"), text_color="#a0a0a0").pack(anchor="w", pady=(5, 2))
+        self.entry_t_hit = self._add_stepper_field(self.sidebar, "Tempo de Hit (ciclos):", "2", step=1)
+        self.entry_miss_penalty = self._add_stepper_field(self.sidebar, "Penalidade Miss (ciclos):", "150", step=10)
 
         # Padrão de Carga
         ctk.CTkLabel(self.sidebar, text="Padrão de Acesso & Carga", font=ctk.CTkFont(size=12, weight="bold"), text_color="#a0a0a0").pack(anchor="w", pady=(10, 2))
@@ -348,6 +376,9 @@ class CacheSimulatorApp(ctk.CTk):
 
         self.card_hit = self._create_kpi_card(self.kpi_frame, "DESEMPENHO MÁXIMO", "Hit Rate Máx: --%", "#00ff96")
         self.card_hit.pack(side="left", fill="x", expand=True, padx=5)
+
+        self.card_amat = self._create_kpi_card(self.kpi_frame, "LATÊNCIA (AMAT)", "AMAT Mín: -- ciclos", "#ff8c42")
+        self.card_amat.pack(side="left", fill="x", expand=True, padx=5)
 
         self.card_status = self._create_kpi_card(self.kpi_frame, "STATUS DO SISTEMA", "Status: Aguardando", "#f0c850")
         self.card_status.pack(side="left", fill="x", expand=True, padx=(5, 0))
@@ -443,6 +474,9 @@ class CacheSimulatorApp(ctk.CTk):
     def _setup_tab_plot(self):
         self.fig_plot, self.ax_plot = plt.subplots(figsize=(8, 4.5), dpi=100)
         self._setup_ax_plot_style()
+        # Eixo secundário (direita) para o AMAT: compartilha o eixo X com ax_plot
+        self.ax_amat = self.ax_plot.twinx()
+        self._setup_ax_amat_style()
 
         self.canvas_plot = FigureCanvasTkAgg(self.fig_plot, master=self.tab_plot)
         self.canvas_plot.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=(5, 0))
@@ -461,8 +495,29 @@ class CacheSimulatorApp(ctk.CTk):
             spine.set_color('#333d52')
         self.ax_plot.set_xlabel("Tamanho do Bloco (log2 Bytes)")
         self.ax_plot.set_ylabel("Taxa de Acerto (Hit Rate)")
-        self.ax_plot.set_title("Taxa de Acerto vs Tamanho do Bloco (Escala Log2)")
+        self.ax_plot.set_title("Taxa de Acerto e AMAT vs Tamanho do Bloco")
         self.ax_plot.grid(True, linestyle='--', alpha=0.2, color='#ffffff')
+
+    def _setup_ax_amat_style(self):
+        """Aplica o estilo escuro ao eixo secundário (AMAT)."""
+        self.ax_amat.patch.set_visible(False)  # Fundo transparente para não cobrir ax_plot
+        self.ax_amat.tick_params(colors='white')
+        self.ax_amat.yaxis.label.set_color('white')
+        for spine in self.ax_amat.spines.values():
+            spine.set_color('#555555')
+        self.ax_amat.set_ylabel("AMAT (ciclos)")
+
+    def _atualizar_legenda_plot(self):
+        """Monta uma legenda única com as curvas dos dois eixos (Hit Rate + AMAT)."""
+        for ax in (self.ax_plot, self.ax_amat):
+            legend = ax.get_legend()
+            if legend:
+                legend.remove()
+        handles = self.plot_lines + self.amat_lines
+        if handles:
+            # A legenda fica no eixo secundário porque ele é desenhado por cima
+            self.ax_amat.legend(handles, [h.get_label() for h in handles],
+                                facecolor='#2b2b36', edgecolor='white', labelcolor='white', fontsize=8)
 
     def _setup_tab_console(self):
         lbl1 = ctk.CTkLabel(self.tab_console, text="Saída do Console da CPU / Logs em Tempo Real:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#a0a0a0")
@@ -695,6 +750,8 @@ class CacheSimulatorApp(ctk.CTk):
             prob_quente = float(self.entry_prob_hot.get())
             blocos_raw = self.entry_blocos_multi.get()
             blocos = [int(b.strip()) for b in blocos_raw.split(",")]
+            t_hit = int(self.entry_t_hit.get())
+            miss_penalty = int(self.entry_miss_penalty.get())
 
             regioes_quentes = [64, 1024, 8192, 32768, 131072, 262144, 524288, 786432, 983040]
 
@@ -710,6 +767,16 @@ class CacheSimulatorApp(ctk.CTk):
 
             if not is_power_of_two(tamanho_cache_bytes) or tamanho_cache_bytes >= memory_size:
                 self.lbl_msg_erro.configure(text="[ERRO] Cache deve ser potência de 2 e menor que a RAM.")
+                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+                return
+
+            if t_hit < 1:
+                self.lbl_msg_erro.configure(text="[ERRO] Tempo de Hit deve ser de pelo menos 1 ciclo.")
+                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+                return
+
+            if miss_penalty < 0:
+                self.lbl_msg_erro.configure(text="[ERRO] Penalidade de Miss não pode ser negativa.")
                 self.card_status.label_val.configure(text="Status: Erro de Entrada")
                 return
 
@@ -739,23 +806,32 @@ class CacheSimulatorApp(ctk.CTk):
                 if not self.is_running:
                     return
 
+                # AMAT a partir do hit rate médio (equivale à média dos AMATs, pois é linear)
+                amat = calcular_amat(taxa_acerto, t_hit, miss_penalty)
+                ciclos_totais = acessos * amat
+                print(f"    Bloco: {bt} B | Hit Rate: {taxa_acerto:.4f} | AMAT: {amat:.2f} ciclos | Ciclos Totais: {ciclos_totais:,.0f}")
+
                 self.progressbar.set(progresso)
-                self.resultados.append((bt, taxa_acerto))
+                self.resultados.append((bt, taxa_acerto, amat, ciclos_totais))
                 self.update_idletasks()
 
             self.atualizar_plot()
             self.desenhar_diagrama_blocos()
 
             if self.resultados and self.is_running:
-                tamanhos, taxas = zip(*self.resultados)
+                tamanhos, taxas, amats, ciclos = zip(*self.resultados)
                 max_hit = max(taxas)
+                min_amat = min(amats)
 
                 self.card_hit.label_val.configure(text=f"Hit Rate Máx: {max_hit*100:.2f}%")
+                self.card_amat.label_val.configure(text=f"AMAT Mín: {min_amat:.2f} ciclos")
                 self.card_status.label_val.configure(text=f"Status: Concluído ({time.time() - start_time:.2f}s)")
 
-                texto = f"// RESULTADOS SIMULAÇÃO ({self.algoritmo_escolhido})\n"
+                texto = f"// RESULTADOS SIMULAÇÃO ({self.algoritmo_escolhido}) | t_hit={t_hit} | penalidade={miss_penalty}\n"
                 texto += f"Tamanhos_de_bloco = [{', '.join(str(int(t)) for t in tamanhos)}];\n"
-                texto += f"Taxa_media_de_acerto = [{', '.join(f'{float(t):.6f}' for t in taxas)}];"
+                texto += f"Taxa_media_de_acerto = [{', '.join(f'{float(t):.6f}' for t in taxas)}];\n"
+                texto += f"AMAT_ciclos = [{', '.join(f'{float(a):.4f}' for a in amats)}];\n"
+                texto += f"Ciclos_totais = [{', '.join(f'{float(c):.2f}' for c in ciclos)}];"
                 
                 self.textbox_resultados.configure(state="normal")
                 self.textbox_resultados.delete("1.0", "end")
@@ -766,9 +842,10 @@ class CacheSimulatorApp(ctk.CTk):
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 caminho_arquivo = os.path.join("Resultados_Simulacao", f"Simulacao_{timestamp}.csv")
                 with open(caminho_arquivo, "w") as f:
-                    f.write("Tamanho_Bloco,Taxa_Acerto\n")
-                    for bloco, taxa in self.resultados:
-                        f.write(f"{bloco},{taxa:.6f}\n")
+                    f.write(f"# t_hit={t_hit},penalidade={miss_penalty},algoritmo={self.algoritmo_escolhido}\n")
+                    f.write("Tamanho_Bloco,Taxa_Acerto,AMAT_ciclos,Ciclos_Totais_Estimados\n")
+                    for bloco, taxa, amat, ciclos_totais in self.resultados:
+                        f.write(f"{bloco},{taxa:.6f},{amat:.4f},{ciclos_totais:.2f}\n")
 
         except Exception as e:
             if self.is_running:
@@ -778,13 +855,20 @@ class CacheSimulatorApp(ctk.CTk):
     def atualizar_plot(self):
         if not self.resultados or not self.is_running:
             return
-        tamanhos, taxas = zip(*self.resultados)
+        tamanhos, taxas, amats, _ = zip(*self.resultados)
         tamanhos_log2 = [math.log2(tam) for tam in tamanhos]
 
-        line, = self.ax_plot.plot(tamanhos_log2, taxas, marker='o', linewidth=2, label=self.algoritmo_escolhido)
+        line, = self.ax_plot.plot(tamanhos_log2, taxas, marker='o', linewidth=2,
+                                  label=f"{self.algoritmo_escolhido} (Hit Rate)")
         self.plot_lines.append(line)
 
-        self.ax_plot.legend(facecolor='#2b2b36', edgecolor='white', labelcolor='white')
+        # Curva de AMAT no eixo secundário: tracejada e com a MESMA cor da curva de hit rate
+        line_amat, = self.ax_amat.plot(tamanhos_log2, amats, linestyle='--', marker='s', markersize=4,
+                                       linewidth=1.5, color=line.get_color(),
+                                       label=f"{self.algoritmo_escolhido} (AMAT)")
+        self.amat_lines.append(line_amat)
+
+        self._atualizar_legenda_plot()
         self.canvas_plot.draw()
 
     def limpar_ultimo_plot(self):
@@ -798,18 +882,23 @@ class CacheSimulatorApp(ctk.CTk):
         if self.plot_lines:
             line = self.plot_lines.pop()
             line.remove()
-            if self.plot_lines:
-                self.ax_plot.legend(facecolor='#2b2b36', edgecolor='white', labelcolor='white')
-            else:
-                legend = self.ax_plot.get_legend()
-                if legend:
-                    legend.remove()
+            # Remove também a curva de AMAT da mesma execução
+            if self.amat_lines:
+                self.amat_lines.pop().remove()
+                self.ax_amat.relim()
+                self.ax_amat.autoscale_view()
+            self._atualizar_legenda_plot()
             self.canvas_plot.draw()
 
     def limpar_plots(self):
         self.plot_lines.clear()
+        self.amat_lines.clear()
+        # Remove o eixo secundário antigo e recria um novo após limpar o principal
+        self.ax_amat.remove()
         self.ax_plot.clear()
         self._setup_ax_plot_style()
+        self.ax_amat = self.ax_plot.twinx()
+        self._setup_ax_amat_style()
         self.canvas_plot.draw()
 
         self.progressbar.set(0.0)
@@ -823,6 +912,7 @@ class CacheSimulatorApp(ctk.CTk):
 
         self.lbl_msg_erro.configure(text="")
         self.card_hit.label_val.configure(text="Hit Rate Máx: --%")
+        self.card_amat.label_val.configure(text="AMAT Mín: -- ciclos")
         self.card_status.label_val.configure(text="Status: Aguardando")
         self.limpar_mapa_calor()
 
