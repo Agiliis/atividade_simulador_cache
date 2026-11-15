@@ -12,7 +12,7 @@ import sys
 import os
 from datetime import datetime
 from abc import ABC, abstractmethod
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import customtkinter as ctk
 
 # Configuração visual inicial do CustomTkinter
@@ -219,6 +219,85 @@ def calcular_amat(hit_rate: float, t_hit: float, miss_penalty: float) -> float:
     """
     return t_hit + (1.0 - hit_rate) * miss_penalty
 
+def formatar_bytes(n: int) -> str:
+    """Formata um tamanho em bytes de forma legível: 512 -> '512', 1024 -> '1K', 65536 -> '64K', 2**20 -> '1M'."""
+    for divisor, sufixo in ((2**30, "G"), (2**20, "M"), (2**10, "K")):
+        if n >= divisor and n % divisor == 0:
+            return f"{n // divisor}{sufixo}"
+    return str(n)
+
+def validar_config(cache_size: int, bloco: int, associatividade: int, memory_size: int) -> Optional[str]:
+    """
+    Verifica se uma configuração (cache, bloco, associatividade) é fisicamente possível.
+    Retorna None se for válida, ou uma string com o motivo da invalidade.
+
+    Regras (na ordem em que são verificadas):
+    - cache, bloco e associatividade devem ser potências de 2 (os campos de
+      endereço offset/índice/tag são extraídos com bits, então precisam de log2 inteiro);
+    - a cache deve ser menor que a RAM;
+    - o bloco não pode ser maior que a cache (senão a cache teria 0 linhas);
+    - a associatividade não pode exceder o nº de linhas (cache // bloco),
+      senão o nº de conjuntos seria 0. Associatividade == nº de linhas é a
+      cache totalmente associativa (FA), com 1 único conjunto.
+    """
+    if cache_size <= 0 or not is_power_of_two(cache_size):
+        return "tamanho da cache não é potência de 2"
+    if cache_size >= memory_size:
+        return "cache deve ser menor que a RAM"
+    if bloco <= 0 or not is_power_of_two(bloco):
+        return "bloco não é potência de 2"
+    if bloco > cache_size:
+        return "bloco maior que a cache"
+    if associatividade <= 0 or not is_power_of_two(associatividade):
+        return "associatividade não é potência de 2"
+    num_linhas = cache_size // bloco
+    if associatividade > num_linhas:
+        return f"associatividade ({associatividade}) maior que o nº de linhas da cache ({num_linhas})"
+    return None
+
+def simulacao_varredura(n_simulacoes: int, acessos: int, memory_size: int, regioes_quentes: List[int],
+                        probs: Tuple[float, float, float], algoritmo: str,
+                        configs: List[Tuple[int, int, int]], progresso_callback=None) -> list:
+    """
+    Varredura de parâmetros com comparação justa entre configurações de hardware.
+
+    configs: lista de tuplas (cache_size, bloco, associatividade).
+    Retorna: lista de tuplas (média do hit rate, desvio padrão), na mesma ordem de configs.
+
+    Em CADA iteração de Monte Carlo é gerado UM único padrão de acessos, e esse
+    MESMO padrão é executado em todas as configurações. Assim, dentro de uma
+    iteração, a única coisa que muda entre as configs é o hardware (cache, bloco
+    ou associatividade): a carga de trabalho é idêntica. Isso isola a variável
+    analisada. Se cada config usasse um padrão sorteado separadamente, parte da
+    diferença de hit rate entre dois pontos viria só da "sorte" do sorteio
+    (ruído), e não do parâmetro de hardware. Essa técnica é conhecida como
+    "números aleatórios comuns" (common random numbers) e reduz a variância
+    da COMPARAÇÃO entre configurações.
+
+    Repetir isso por n_simulacoes iterações (cada uma com um padrão novo) ainda
+    dá a média e o desvio padrão sobre diferentes cargas, como no Monte Carlo original.
+
+    progresso_callback (opcional): função chamada com a fração concluída (0..1)
+    após cada execução, usada pela GUI para atualizar a barra de progresso.
+    """
+    taxas_por_config = [[] for _ in configs]
+    total_execucoes = n_simulacoes * len(configs)
+    concluidas = 0
+
+    for _ in range(n_simulacoes):
+        padrao = gerar_padrao_realista(acessos, memory_size, regioes_quentes, probs)  # UM padrão por iteração
+        for i, (cache_size, bloco, associatividade) in enumerate(configs):
+            cache = CacheMemory(cache_size, bloco, associatividade, algoritmo)  # cache nova (vazia) por config
+            for endereco in padrao:
+                cache.request_access(endereco)
+            taxas_por_config[i].append(cache.hit_rate)
+
+            concluidas += 1
+            if progresso_callback is not None:
+                progresso_callback(concluidas / total_execucoes)
+
+    return [(float(np.mean(t)), float(np.std(t))) for t in taxas_por_config]
+
 class CustomTkRedirector:
     def __init__(self, textbox: ctk.CTkTextbox):
         self.textbox = textbox
@@ -248,6 +327,31 @@ class StyledNavigationToolbar(NavigationToolbar2Tk):
 # ==============================================================================
 
 class CacheSimulatorApp(ctk.CTk):
+    # Atividade 4: configuração de cada modo de varredura (variável analisada)
+    MODOS_VARREDURA = {
+        "Tamanho do Bloco": {
+            "rotulo_lista": "Blocos Analisados (Bytes):",
+            "padrao": "2,4,8,16,32,64,128,256,512",
+            "eixo_x": "Tamanho do Bloco (Bytes, escala log2)",
+            "coluna_csv": "Tamanho_Bloco",
+            "prefixo": "Bloco",
+        },
+        "Associatividade": {
+            "rotulo_lista": "Associatividades (vias):",
+            "padrao": "1,2,4,8,16,32,FA",
+            "eixo_x": "Associatividade (vias, escala log2)",
+            "coluna_csv": "Associatividade",
+            "prefixo": "Assoc",
+        },
+        "Tamanho da Cache": {
+            "rotulo_lista": "Tamanhos de Cache (Bytes):",
+            "padrao": "1024,2048,4096,8192,16384,32768,65536",
+            "eixo_x": "Tamanho da Cache (Bytes, escala log2)",
+            "coluna_csv": "Tamanho_Cache",
+            "prefixo": "Cache",
+        },
+    }
+
     def __init__(self):
         super().__init__()
 
@@ -259,6 +363,9 @@ class CacheSimulatorApp(ctk.CTk):
         self.resultados = []
         self.plot_lines = []
         self.amat_lines = []  # Curvas de AMAT (eixo secundário), paralelas a plot_lines
+        self.plot_ticks = []  # Para cada execução plotada: {x_log2: rótulo legível}, paralela a plot_lines
+        self.modo_varredura = "Tamanho do Bloco"  # Modo selecionado na sidebar
+        self.modo_plotado = None  # Modo das curvas atualmente no gráfico
         self.is_running = True
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -326,6 +433,15 @@ class CacheSimulatorApp(ctk.CTk):
         self.entry_prob_temp = self._add_stepper_field(self.sidebar, "Prob. Temporal:", "0.20", step=0.05, is_float=True)
         self.entry_prob_esp = self._add_stepper_field(self.sidebar, "Prob. Espacial:", "0.20", step=0.05, is_float=True)
         self.entry_prob_hot = self._add_stepper_field(self.sidebar, "Prob. Hot Regions:", "0.40", step=0.05, is_float=True)
+
+        # Varredura de Parâmetros - Atividade 4
+        ctk.CTkLabel(self.sidebar, text="Varredura de Parâmetros (Ativ. 4)", font=ctk.CTkFont(size=12, weight="bold"), text_color="#a0a0a0").pack(anchor="w", pady=(10, 2))
+        ctk.CTkLabel(self.sidebar, text="Variável analisada:", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 2))
+        self.combo_modo = ctk.CTkComboBox(self.sidebar, values=list(self.MODOS_VARREDURA.keys()), command=self._selecionar_modo_varredura)
+        self.combo_modo.set(self.modo_varredura)
+        self.combo_modo.pack(fill="x", pady=(0, 5))
+        self.entry_bloco_fixo = self._add_stepper_field(self.sidebar, "Bloco fixo (Bytes):", "16", is_pow2=True)
+        self.entry_bloco_fixo.configure(state="disabled")  # No modo "Tamanho do Bloco" o bloco fixo não é usado
 
         # Blocos Analisados (Container Dinâmico)
         self.lbl_blocos_title = ctk.CTkLabel(self.sidebar, text="Blocos Analisados (Bytes):", font=ctk.CTkFont(size=12, weight="bold"), text_color="#a0a0a0")
@@ -406,7 +522,8 @@ class CacheSimulatorApp(ctk.CTk):
             self.frame_bloco_single.pack(fill="x")
             self.desenhar_diagrama_blocos()
         else:
-            self.lbl_blocos_title.configure(text="Blocos Analisados (Bytes):")
+            # Restaura o rótulo do modo de varredura atual (não necessariamente "Blocos")
+            self.lbl_blocos_title.configure(text=self.MODOS_VARREDURA[self.modo_varredura]["rotulo_lista"])
             self.frame_bloco_single.pack_forget()
             self.entry_blocos_multi.pack(fill="x")
 
@@ -493,9 +610,9 @@ class CacheSimulatorApp(ctk.CTk):
         self.ax_plot.title.set_color('#00c8ff')
         for spine in self.ax_plot.spines.values():
             spine.set_color('#333d52')
-        self.ax_plot.set_xlabel("Tamanho do Bloco (log2 Bytes)")
+        self.ax_plot.set_xlabel(self.MODOS_VARREDURA[self.modo_varredura]["eixo_x"])
         self.ax_plot.set_ylabel("Taxa de Acerto (Hit Rate)")
-        self.ax_plot.set_title("Taxa de Acerto e AMAT vs Tamanho do Bloco")
+        self.ax_plot.set_title(f"Taxa de Acerto e AMAT vs {self.modo_varredura}")
         self.ax_plot.grid(True, linestyle='--', alpha=0.2, color='#ffffff')
 
     def _setup_ax_amat_style(self):
@@ -518,6 +635,17 @@ class CacheSimulatorApp(ctk.CTk):
             # A legenda fica no eixo secundário porque ele é desenhado por cima
             self.ax_amat.legend(handles, [h.get_label() for h in handles],
                                 facecolor='#2b2b36', edgecolor='white', labelcolor='white', fontsize=8)
+
+    def _atualizar_xticks(self):
+        """Posiciona os ticks do eixo X (em log2) com os rótulos reais de todas as execuções plotadas."""
+        if not self.plot_ticks:
+            return
+        ticks = {}
+        for mapa in self.plot_ticks:
+            ticks.update(mapa)
+        posicoes = sorted(ticks)
+        self.ax_plot.set_xticks(posicoes)
+        self.ax_plot.set_xticklabels([ticks[x] for x in posicoes], fontsize=8)
 
     def _setup_tab_console(self):
         lbl1 = ctk.CTkLabel(self.tab_console, text="Saída do Console da CPU / Logs em Tempo Real:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#a0a0a0")
@@ -733,6 +861,76 @@ class CacheSimulatorApp(ctk.CTk):
         self.algoritmo_escolhido = choice
         self.card_algo.label_val.configure(text=f"Algoritmo: {self.algoritmo_escolhido}")
 
+    def _selecionar_modo_varredura(self, modo):
+        """Troca a variável analisada: ajusta rótulo e valores padrão da lista e habilita o 'Bloco fixo'."""
+        self.modo_varredura = modo
+        cfg = self.MODOS_VARREDURA[modo]
+
+        self.entry_blocos_multi.delete(0, "end")
+        self.entry_blocos_multi.insert(0, cfg["padrao"])
+
+        # Na aba Diagrama o rótulo é controlado por on_tab_change; ele será restaurado ao sair dela
+        if self.tabview.get() != " Diagrama em Blocos":
+            self.lbl_blocos_title.configure(text=cfg["rotulo_lista"])
+
+        self.entry_bloco_fixo.configure(state="disabled" if modo == "Tamanho do Bloco" else "normal")
+
+    def _montar_configs(self, modo, valores_raw, cache_fixo, assoc_fixo, bloco_fixo, memory_size):
+        """
+        Converte a lista digitada em configurações (cache, bloco, assoc) conforme o modo.
+        Configs inválidas são PULADAS com aviso no console.
+        Retorna lista ordenada de (valor_da_variavel, rotulo_eixo_x, (cache, bloco, assoc)).
+        """
+        pontos = []
+        for token in [t.strip() for t in valores_raw.split(",") if t.strip()]:
+            try:
+                if modo == "Associatividade" and token.upper() == "FA":
+                    # Totalmente associativa: nº de vias = nº de linhas -> 1 único conjunto
+                    cache, bloco, assoc = cache_fixo, bloco_fixo, cache_fixo // bloco_fixo
+                    rotulo = "FA"
+                else:
+                    valor = int(token)
+                    if modo == "Tamanho do Bloco":
+                        cache, bloco, assoc = cache_fixo, valor, assoc_fixo
+                        rotulo = str(valor)
+                    elif modo == "Associatividade":
+                        cache, bloco, assoc = cache_fixo, bloco_fixo, valor
+                        rotulo = "1 (direto)" if valor == 1 else str(valor)
+                    else:  # "Tamanho da Cache"
+                        cache, bloco, assoc = valor, bloco_fixo, assoc_fixo
+                        rotulo = formatar_bytes(valor)
+            except (ValueError, ZeroDivisionError):
+                extra = " nem 'FA'" if modo == "Associatividade" else ""
+                print(f"[AVISO] Valor '{token}' pulado: não é um número inteiro{extra}.")
+                continue
+
+            motivo = validar_config(cache, bloco, assoc, memory_size)
+            if motivo:
+                print(f"[AVISO] Config '{token}' pulada (cache={cache}B, bloco={bloco}B, assoc={assoc}): {motivo}.")
+                continue
+
+            valor_variavel = {"Tamanho do Bloco": bloco, "Associatividade": assoc, "Tamanho da Cache": cache}[modo]
+            pontos.append((valor_variavel, rotulo, (cache, bloco, assoc)))
+
+        pontos.sort(key=lambda p: p[0])  # Ordena pelo valor real para a curva ficar monotônica no eixo X
+        return pontos
+
+    @staticmethod
+    def _descrever_fixos(modo, cache, bloco, assoc):
+        """Texto dos parâmetros que ficaram FIXOS no modo (para legenda/console). Ex.: 'cache 8K, bloco 16B'."""
+        partes = []
+        if modo != "Tamanho da Cache":
+            partes.append(f"cache {formatar_bytes(cache)}")
+        if modo != "Tamanho do Bloco":
+            partes.append(f"bloco {bloco}B")
+        if modo != "Associatividade":
+            partes.append(f"{assoc} vias")
+        return ", ".join(partes)
+
+    def _erro_entrada(self, mensagem):
+        self.lbl_msg_erro.configure(text=mensagem)
+        self.card_status.label_val.configure(text="Status: Erro de Entrada")
+
     def rodar_simulacao_callback(self):
         start_time = time.time()
         self.lbl_msg_erro.configure(text="")
@@ -740,86 +938,98 @@ class CacheSimulatorApp(ctk.CTk):
         self.update_idletasks()
 
         try:
+            modo = self.modo_varredura
+            cfg_modo = self.MODOS_VARREDURA[modo]
+
             memory_size = int(self.entry_ram.get())
             acessos = int(self.entry_acessos.get())
             tamanho_cache_bytes = int(self.entry_cache.get())
             associatividade = int(self.entry_assoc.get())
+            bloco_fixo = int(self.entry_bloco_fixo.get())
             n_simulacoes = int(self.entry_sims.get())
             prob_temporal = float(self.entry_prob_temp.get())
             prob_espacial = float(self.entry_prob_esp.get())
             prob_quente = float(self.entry_prob_hot.get())
-            blocos_raw = self.entry_blocos_multi.get()
-            blocos = [int(b.strip()) for b in blocos_raw.split(",")]
+            valores_raw = self.entry_blocos_multi.get()
             t_hit = int(self.entry_t_hit.get())
             miss_penalty = int(self.entry_miss_penalty.get())
 
             regioes_quentes = [64, 1024, 8192, 32768, 131072, 262144, 524288, 786432, 983040]
 
             if not (2**20 <= memory_size <= 2**30) or not is_power_of_two(memory_size):
-                self.lbl_msg_erro.configure(text="[ERRO] Memory Size deve ser potência de 2 entre 2^20 e 2^30.")
-                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+                self._erro_entrada("[ERRO] Memory Size deve ser potência de 2 entre 2^20 e 2^30.")
                 return
 
-            if not is_power_of_two(associatividade):
-                self.lbl_msg_erro.configure(text="[ERRO] Associatividade deve ser potência de 2.")
-                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+            # Os campos fixos só são validados nos modos em que são usados
+            if modo != "Associatividade" and not is_power_of_two(associatividade):
+                self._erro_entrada("[ERRO] Associatividade deve ser potência de 2.")
                 return
 
-            if not is_power_of_two(tamanho_cache_bytes) or tamanho_cache_bytes >= memory_size:
-                self.lbl_msg_erro.configure(text="[ERRO] Cache deve ser potência de 2 e menor que a RAM.")
-                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+            if modo != "Tamanho da Cache" and (not is_power_of_two(tamanho_cache_bytes) or tamanho_cache_bytes >= memory_size):
+                self._erro_entrada("[ERRO] Cache deve ser potência de 2 e menor que a RAM.")
+                return
+
+            if modo != "Tamanho do Bloco" and not is_power_of_two(bloco_fixo):
+                self._erro_entrada("[ERRO] Bloco fixo deve ser potência de 2.")
                 return
 
             if t_hit < 1:
-                self.lbl_msg_erro.configure(text="[ERRO] Tempo de Hit deve ser de pelo menos 1 ciclo.")
-                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+                self._erro_entrada("[ERRO] Tempo de Hit deve ser de pelo menos 1 ciclo.")
                 return
 
             if miss_penalty < 0:
-                self.lbl_msg_erro.configure(text="[ERRO] Penalidade de Miss não pode ser negativa.")
-                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+                self._erro_entrada("[ERRO] Penalidade de Miss não pode ser negativa.")
+                return
+
+            # Não misturar eixos X diferentes: se o modo mudou, limpa o gráfico antes de simular
+            # (feito ANTES dos prints porque limpar_plots também limpa o console)
+            if self.plot_lines and self.modo_plotado is not None and self.modo_plotado != modo:
+                self.limpar_plots()
+                print(f"[INFO] Variável analisada mudou para '{modo}': gráfico reiniciado.")
+                self.card_status.label_val.configure(text="Status: Executando...")
+
+            fixos = self._descrever_fixos(modo, tamanho_cache_bytes, bloco_fixo, associatividade)
+            print(f"=== Varredura: {modo} | Fixos: {fixos} | {self.algoritmo_escolhido} | "
+                  f"{n_simulacoes} sims x {acessos} acessos (mesmo padrão para todas as configs) ===")
+
+            pontos = self._montar_configs(modo, valores_raw, tamanho_cache_bytes, associatividade, bloco_fixo, memory_size)
+            if not pontos:
+                self._erro_entrada("[ERRO] Nenhuma configuração válida para simular (veja avisos no console).")
                 return
 
             self.resultados.clear()
-            contador_barra = 0
             self.progressbar.set(0.01)
             self.update_idletasks()
 
-            for bt in blocos:
-                if not self.is_running:
-                    return
-
-                if bt <= 0 or not is_power_of_two(bt):
-                    self.lbl_msg_erro.configure(text=f"[ERRO] Bloco {bt} inválido. Use potências de 2.")
-                    self.card_status.label_val.configure(text="Status: Erro de Entrada")
-                    return
-                
-                contador_barra += 1
-                progresso = contador_barra / len(blocos)
-
-                taxa_acerto = simulacao_monte_carlo(
-                    n_simulacoes, acessos, memory_size, tamanho_cache_bytes,
-                    associatividade, regioes_quentes, (prob_temporal, prob_espacial, prob_quente),
-                    bt, self.algoritmo_escolhido
-                )
-
-                if not self.is_running:
-                    return
-
-                # AMAT a partir do hit rate médio (equivale à média dos AMATs, pois é linear)
-                amat = calcular_amat(taxa_acerto, t_hit, miss_penalty)
-                ciclos_totais = acessos * amat
-                print(f"    Bloco: {bt} B | Hit Rate: {taxa_acerto:.4f} | AMAT: {amat:.2f} ciclos | Ciclos Totais: {ciclos_totais:,.0f}")
-
-                self.progressbar.set(progresso)
-                self.resultados.append((bt, taxa_acerto, amat, ciclos_totais))
+            def atualizar_progresso(fracao):
+                self.progressbar.set(max(0.01, fracao))
                 self.update_idletasks()
 
-            self.atualizar_plot()
+            configs = [p[2] for p in pontos]
+            estatisticas = simulacao_varredura(
+                n_simulacoes, acessos, memory_size, regioes_quentes,
+                (prob_temporal, prob_espacial, prob_quente), self.algoritmo_escolhido,
+                configs, progresso_callback=atualizar_progresso
+            )
+
+            if not self.is_running:
+                return
+
+            for (valor, rotulo, (cache, bloco, assoc)), (taxa, desvio) in zip(pontos, estatisticas):
+                num_linhas = cache // bloco
+                num_conjuntos = num_linhas // assoc
+                # AMAT a partir do hit rate médio (equivale à média dos AMATs, pois é linear)
+                amat = calcular_amat(taxa, t_hit, miss_penalty)
+                ciclos_totais = acessos * amat
+                print(f"    {cfg_modo['prefixo']}: {rotulo:>10} | Linhas: {num_linhas:>5} | Conjuntos: {num_conjuntos:>5} | "
+                      f"Hit: {taxa:.4f} ± {desvio:.4f} | AMAT: {amat:.2f} ciclos | Ciclos: {ciclos_totais:,.0f}")
+                self.resultados.append((valor, rotulo, num_linhas, num_conjuntos, taxa, desvio, amat, ciclos_totais))
+
+            self.atualizar_plot(modo, fixos)
             self.desenhar_diagrama_blocos()
 
             if self.resultados and self.is_running:
-                tamanhos, taxas, amats, ciclos = zip(*self.resultados)
+                valores, rotulos, linhas, conjuntos, taxas, desvios, amats, ciclos = zip(*self.resultados)
                 max_hit = max(taxas)
                 min_amat = min(amats)
 
@@ -827,46 +1037,73 @@ class CacheSimulatorApp(ctk.CTk):
                 self.card_amat.label_val.configure(text=f"AMAT Mín: {min_amat:.2f} ciclos")
                 self.card_status.label_val.configure(text=f"Status: Concluído ({time.time() - start_time:.2f}s)")
 
-                texto = f"// RESULTADOS SIMULAÇÃO ({self.algoritmo_escolhido}) | t_hit={t_hit} | penalidade={miss_penalty}\n"
-                texto += f"Tamanhos_de_bloco = [{', '.join(str(int(t)) for t in tamanhos)}];\n"
+                texto = (f"// RESULTADOS SIMULAÇÃO ({self.algoritmo_escolhido}) | Modo: {modo} | Fixos: {fixos} | "
+                         f"t_hit={t_hit} | penalidade={miss_penalty}\n")
+                texto += f"{cfg_modo['coluna_csv']} = [{', '.join(str(int(v)) for v in valores)}];\n"
+                texto += f"Rotulos_eixo_x = [{', '.join(repr(r) for r in rotulos)}];\n"
+                texto += f"Num_Linhas = [{', '.join(str(n) for n in linhas)}];\n"
+                texto += f"Num_Conjuntos = [{', '.join(str(n) for n in conjuntos)}];\n"
                 texto += f"Taxa_media_de_acerto = [{', '.join(f'{float(t):.6f}' for t in taxas)}];\n"
+                texto += f"Desvio_padrao = [{', '.join(f'{float(d):.6f}' for d in desvios)}];\n"
                 texto += f"AMAT_ciclos = [{', '.join(f'{float(a):.4f}' for a in amats)}];\n"
                 texto += f"Ciclos_totais = [{', '.join(f'{float(c):.2f}' for c in ciclos)}];"
-                
+
                 self.textbox_resultados.configure(state="normal")
                 self.textbox_resultados.delete("1.0", "end")
                 self.textbox_resultados.insert("1.0", texto)
                 self.textbox_resultados.configure(state="disabled")
 
+                # Parâmetros fixos no comentário do CSV, separados por ';' para não quebrar as colunas
+                fixos_csv = []
+                if modo != "Tamanho da Cache":
+                    fixos_csv.append(f"cache={tamanho_cache_bytes}")
+                if modo != "Tamanho do Bloco":
+                    fixos_csv.append(f"bloco={bloco_fixo}")
+                if modo != "Associatividade":
+                    fixos_csv.append(f"assoc={associatividade}")
+                comentario = (f"# modo={cfg_modo['coluna_csv']},fixos={';'.join(fixos_csv)},"
+                              f"algoritmo={self.algoritmo_escolhido},t_hit={t_hit},penalidade={miss_penalty}")
+                if "FA" in rotulos:
+                    comentario += f",FA={valores[rotulos.index('FA')]} vias"
+
                 os.makedirs("Resultados_Simulacao", exist_ok=True)
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 caminho_arquivo = os.path.join("Resultados_Simulacao", f"Simulacao_{timestamp}.csv")
-                with open(caminho_arquivo, "w") as f:
-                    f.write(f"# t_hit={t_hit},penalidade={miss_penalty},algoritmo={self.algoritmo_escolhido}\n")
-                    f.write("Tamanho_Bloco,Taxa_Acerto,AMAT_ciclos,Ciclos_Totais_Estimados\n")
-                    for bloco, taxa, amat, ciclos_totais in self.resultados:
-                        f.write(f"{bloco},{taxa:.6f},{amat:.4f},{ciclos_totais:.2f}\n")
+                with open(caminho_arquivo, "w", encoding="utf-8") as f:
+                    f.write(comentario + "\n")
+                    f.write(f"{cfg_modo['coluna_csv']},Num_Linhas,Num_Conjuntos,Taxa_Acerto,Desvio_Padrao,AMAT_ciclos,Ciclos_Totais_Estimados\n")
+                    for valor, _, num_linhas, num_conjuntos, taxa, desvio, amat, ciclos_totais in self.resultados:
+                        f.write(f"{valor},{num_linhas},{num_conjuntos},{taxa:.6f},{desvio:.6f},{amat:.4f},{ciclos_totais:.2f}\n")
 
         except Exception as e:
             if self.is_running:
                 self.lbl_msg_erro.configure(text=f"[ERRO INESPERADO] {str(e)}")
                 self.card_status.label_val.configure(text="Status: Falha na Execução")
 
-    def atualizar_plot(self):
+    def atualizar_plot(self, modo, fixos):
         if not self.resultados or not self.is_running:
             return
-        tamanhos, taxas, amats, _ = zip(*self.resultados)
-        tamanhos_log2 = [math.log2(tam) for tam in tamanhos]
+        valores, rotulos, _, _, taxas, _, amats, _ = zip(*self.resultados)
+        # Eixo X em log2 do valor real (para FA, valor = nº real de vias)
+        x_log2 = [math.log2(v) for v in valores]
+        legenda = f"{self.algoritmo_escolhido} ({fixos})"
 
-        line, = self.ax_plot.plot(tamanhos_log2, taxas, marker='o', linewidth=2,
-                                  label=f"{self.algoritmo_escolhido} (Hit Rate)")
+        line, = self.ax_plot.plot(x_log2, taxas, marker='o', linewidth=2, label=f"{legenda} - Hit Rate")
         self.plot_lines.append(line)
 
         # Curva de AMAT no eixo secundário: tracejada e com a MESMA cor da curva de hit rate
-        line_amat, = self.ax_amat.plot(tamanhos_log2, amats, linestyle='--', marker='s', markersize=4,
-                                       linewidth=1.5, color=line.get_color(),
-                                       label=f"{self.algoritmo_escolhido} (AMAT)")
+        line_amat, = self.ax_amat.plot(x_log2, amats, linestyle='--', marker='s', markersize=4,
+                                       linewidth=1.5, color=line.get_color(), label=f"{legenda} - AMAT")
         self.amat_lines.append(line_amat)
+
+        # Rótulos legíveis no eixo X ("1 (direto)", "FA", "8K"...) nas posições log2
+        self.plot_ticks.append(dict(zip(x_log2, rotulos)))
+        self._atualizar_xticks()
+
+        cfg_modo = self.MODOS_VARREDURA[modo]
+        self.ax_plot.set_xlabel(cfg_modo["eixo_x"])
+        self.ax_plot.set_title(f"Taxa de Acerto e AMAT vs {modo}")
+        self.modo_plotado = modo
 
         self._atualizar_legenda_plot()
         self.canvas_plot.draw()
@@ -887,12 +1124,19 @@ class CacheSimulatorApp(ctk.CTk):
                 self.amat_lines.pop().remove()
                 self.ax_amat.relim()
                 self.ax_amat.autoscale_view()
+            if self.plot_ticks:
+                self.plot_ticks.pop()
+                self._atualizar_xticks()
+            if not self.plot_lines:
+                self.modo_plotado = None  # Gráfico vazio: qualquer modo pode ser plotado sem reset
             self._atualizar_legenda_plot()
             self.canvas_plot.draw()
 
     def limpar_plots(self):
         self.plot_lines.clear()
         self.amat_lines.clear()
+        self.plot_ticks.clear()
+        self.modo_plotado = None
         # Remove o eixo secundário antigo e recria um novo após limpar o principal
         self.ax_amat.remove()
         self.ax_plot.clear()
