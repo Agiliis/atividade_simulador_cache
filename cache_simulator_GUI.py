@@ -81,35 +81,65 @@ class CacheSet:
         self.lines: List[CacheLine] = [CacheLine() for _ in range(associativity)]
         self.policy: EvictionPolicy = policy
 
-    def access(self, tag: int, current_time: int) -> bool:
+    def access(self, tag: int, operation: str, current_time: int, write_policy: str) -> Tuple[bool, int]:
+        """
+        Retorna: (hit: bool, ram_writes_caused: int)
+        """
+        ram_writes = 0
+
+        # 1. Tenta achar HIT
         for line in self.lines:
             if line.valid_bit and line.tag == tag:
                 line.update_access_metadata(current_time)
-                return True
+                if operation == "WRITE":
+                    line.dirty_bit = True
+                    if write_policy == "Write-Through":
+                        ram_writes += 1  # Escreve na RAM imediatamente
+                return True, ram_writes
 
+        # 2. Se for MISS, procura linha vazia ou escolhe vítima
+        target_line = None
         for line in self.lines:
             if not line.valid_bit:
-                self._insert_block(line, tag, current_time)
-                return False
+                target_line = line
+                break
 
-        victim_line = self.policy.find_victim(self.lines)
-        self._insert_block(victim_line, tag, current_time)
-        return False
+        if target_line is None:
+            # Conjunto cheio: escolhe vítima pelo algoritmo de substituição (LRU, FIFO, etc.)
+            victim_line = self.policy.find_victim(self.lines)
+            
+            # Se for Write-Back e a vítima estiver suja, precisa escrever de volta na RAM antes de descartar
+            if write_policy == "Write-Back" and victim_line.valid_bit and victim_line.dirty_bit:
+                ram_writes += 1  
+            
+            target_line = victim_line
 
-    def _insert_block(self, line: CacheLine, tag: int, current_time: int) -> None:
+        # Insere o novo bloco (Política Write-Allocate padrão)
+        self._insert_block(target_line, tag, operation, current_time, write_policy)
+        if operation == "WRITE" and write_policy == "Write-Through":
+            ram_writes += 1
+
+        return False, ram_writes
+
+    def _insert_block(self, line: CacheLine, tag: int, operation: str, current_time: int, write_policy: str) -> None:
         line.valid_bit = True
         line.tag = tag
         line.insertion_time = current_time
         line.last_access_time = current_time
         line.access_frequency = 1
-        line.dirty_bit = False
+        
+        # Se for escrita, o dirty_bit inicia como True (pois foi modificado na carga)
+        line.dirty_bit = True if operation == "WRITE" else False
 
 
 class CacheMemory:
-    def __init__(self, cache_size_bytes: int, block_size_bytes: int, associativity: int, policy_name: str):
+    def __init__(self, cache_size_bytes: int, block_size_bytes: int, associativity: int, policy_name: str, write_policy: str = "Write-Back"):
         self.cache_size = cache_size_bytes
         self.block_size = block_size_bytes
         self.associativity = associativity
+        if write_policy not in ("Write-Back", "Write-Through"):
+            raise ValueError(f"Política de escrita desconhecida: {write_policy!r}")
+        self.write_policy = write_policy  # "Write-Back" ou "Write-Through"
         
         self.num_blocks = self.cache_size // self.block_size
         self.num_sets = self.num_blocks // self.associativity
@@ -117,14 +147,18 @@ class CacheMemory:
         self.offset_bits = int(math.log2(self.block_size))
         self.index_bits = int(math.log2(self.num_sets))
         
-        policy_map = {"FIFO": FIFO(), "LRU": LRU(), "LFU": LFU(), "Random": RandomPolicy(), "LRFU (adicional)": LRFU()}
-        self.policy = policy_map.get(policy_name, FIFO())
+        policy_map = {"FIFO": FIFO(), "LRU": LRU(), "LFU": LFU(), "Random": RandomPolicy(), "LRFU": LRFU()}
+        if policy_name not in policy_map:
+            # Antes caía silenciosamente em FIFO, o que escondia nomes errados
+            raise ValueError(f"Algoritmo de substituição desconhecido: {policy_name!r}")
+        self.policy = policy_map[policy_name]
 
         self.sets: List[CacheSet] = [CacheSet(self.associativity, self.policy) for _ in range(self.num_sets)]
         
         self.global_clock: int = 0
         self.hits: int = 0
         self.misses: int = 0
+        self.total_ram_writes: int = 0  # Métrica adicional para comparar Write-Back vs Write-Through
 
     def calculate_address_fields(self, address: int) -> Tuple[int, int, int]:
         offset_mask = (1 << self.offset_bits) - 1
@@ -136,15 +170,37 @@ class CacheMemory:
         tag = address >> (self.offset_bits + self.index_bits)
         return tag, index, offset
 
-    def request_access(self, address: int) -> bool:
+    def request_access(self, address: int, operation: str = "READ") -> bool:
         self.global_clock += 1
         tag, index, _ = self.calculate_address_fields(address)
-        hit = self.sets[index].access(tag, self.global_clock)
+        
+        hit, ram_writes = self.sets[index].access(tag, operation, self.global_clock, self.write_policy)
+        
+        self.total_ram_writes += ram_writes
         if hit:
             self.hits += 1
         else:
             self.misses += 1
         return hit
+
+    def flush_dirty(self) -> int:
+        """
+        Descarrega para a RAM as linhas sujas que sobraram na cache ao fim da simulação.
+        Só tem efeito em Write-Back (no Write-Through a RAM já está sempre atualizada).
+        Retorna quantas linhas foram descarregadas.
+        """
+        if self.write_policy != "Write-Back":
+            return 0
+
+        descarregadas = 0
+        for cache_set in self.sets:
+            for line in cache_set.lines:
+                if line.valid_bit and line.dirty_bit:
+                    line.dirty_bit = False
+                    descarregadas += 1
+
+        self.total_ram_writes += descarregadas
+        return descarregadas
 
     @property
     def hit_rate(self) -> float:
@@ -182,6 +238,34 @@ def gerar_padrao_realista(acessos: int, memory_size: int, regioes_quentes: List[
 
     return padrao
 
+def gerar_padrao_com_escritas(acessos: int, memory_size: int, regioes_quentes: List[int], probs: Tuple[float, float, float],
+                              prob_escrita: float = 0.15) -> List[Tuple[int, str]]:
+    prob_temporal, prob_espacial, prob_quente = probs
+    padrao = []
+    endereco_anterior = random.randint(0, memory_size - 1)
+    
+    for _ in range(acessos):
+        r = random.random()
+        if r < prob_temporal:
+            endereco = endereco_anterior
+        elif r < prob_temporal + prob_espacial:
+            deslocamento = random.randint(-16, 16)
+            endereco = max(0, min(memory_size - 1, endereco_anterior + deslocamento))
+        elif r < prob_temporal + prob_espacial + prob_quente:
+            base = random.choice(regioes_quentes)
+            deslocamento = random.randint(0, 3)
+            endereco = min(memory_size - 1, base + deslocamento)
+        else:
+            endereco = random.randint(0, memory_size - 1)
+
+        # Define se o acesso é WRITE (com probabilidade prob_escrita) ou READ
+        operacao = "WRITE" if random.random() < prob_escrita else "READ"
+        
+        padrao.append((endereco, operacao))
+        endereco_anterior = endereco
+
+    return padrao
+
 def simulacao_monte_carlo(n_simulacoes: int, acessos: int, memory_size: int, cache_size: int,
                           associatividade: int, regioes_quentes: List[int], probs: Tuple[float, float, float],
                           bloco_tamanho: int, algoritmo: str) -> float:
@@ -196,6 +280,54 @@ def simulacao_monte_carlo(n_simulacoes: int, acessos: int, memory_size: int, cac
 
     print(f"--- Bloco: {bloco_tamanho} Bytes | Hit Rate Médio: {np.mean(taxas_acerto):.4f} | Std: {np.std(taxas_acerto):.4f} ---")
     return float(np.mean(taxas_acerto))
+
+OPCAO_COMPARAR = "Comparar WB x WT"
+POLITICAS_ESCRITA = ["Write-Back", "Write-Through"]
+# (estilo de linha, marcador) por política, para diferenciar WB e WT nos gráficos
+ESTILO_POLITICA = {"Write-Back": ("-", "o"), "Write-Through": ("--", "s")}
+
+
+def simulacao_monte_carlo_com_escritas(n_simulacoes: int, acessos: int, memory_size: int, cache_size: int,
+                                      associatividade: int, regioes_quentes: List[int], probs: Tuple[float, float, float],
+                                      bloco_tamanho: int, algoritmo: str, politicas: List[str],
+                                      prob_escrita: float = 0.15, flush_final: bool = False):
+    """
+    Roda n_simulacoes traces com READ/WRITE. Cada trace é gerada UMA vez e executada em todas as
+    políticas de escrita pedidas (comparação pareada: mesmos endereços e mesmas operações).
+
+    Retorna: {politica: (hit_rate_medio, escritas_ram_medias)}
+    """
+    taxas_acerto = {p: [] for p in politicas}
+    escritas_ram = {p: [] for p in politicas}
+
+    for _ in range(n_simulacoes):
+        padrao = gerar_padrao_com_escritas(acessos, memory_size, regioes_quentes, probs, prob_escrita)
+        # Guarda o estado do RNG para que o algoritmo Random faça as mesmas escolhas em cada política
+        estado_rng = random.getstate()
+
+        for politica in politicas:
+            random.setstate(estado_rng)
+            cache = CacheMemory(cache_size, bloco_tamanho, associatividade, algoritmo, politica)
+
+            for endereco, operacao in padrao:
+                cache.request_access(endereco, operacao)
+
+            if flush_final:
+                cache.flush_dirty()
+
+            taxas_acerto[politica].append(cache.hit_rate)
+            escritas_ram[politica].append(cache.total_ram_writes)
+
+    resultado = {}
+    for politica in politicas:
+        hit_medio = float(np.mean(taxas_acerto[politica]))
+        escritas_medias = float(np.mean(escritas_ram[politica]))
+        resultado[politica] = (hit_medio, escritas_medias)
+        print(f"--- Bloco: {bloco_tamanho} B | {politica} | Hit Rate: {hit_medio:.4f} "
+              f"(Std {np.std(taxas_acerto[politica]):.4f}) | Escritas RAM: {escritas_medias:.1f} ---")
+
+    return resultado
+
 
 class CustomTkRedirector:
     def __init__(self, textbox: ctk.CTkTextbox):
@@ -234,7 +366,7 @@ class CacheSimulatorApp(ctk.CTk):
         self.minsize(1100, 700)
 
         self.algoritmo_escolhido = "FIFO"
-        self.resultados = []
+        self.resultados = {}  # {politica_de_escrita: [(bloco, hit_rate, escritas_ram), ...]}
         self.plot_lines = []
         self.is_running = True
 
@@ -286,9 +418,17 @@ class CacheSimulatorApp(ctk.CTk):
         self.entry_assoc = self._add_stepper_field(self.sidebar, "Associatividade:", "16", is_pow2=True)
 
         ctk.CTkLabel(self.sidebar, text="Algoritmo de Substituição:", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(5, 2))
-        self.combo_algo = ctk.CTkComboBox(self.sidebar, values=["FIFO", "LRU", "LFU", "Random", "LRFU (adicional)"], command=self._selecionar_algoritmo)
+        self.combo_algo = ctk.CTkComboBox(self.sidebar, values=["FIFO", "LRU", "LFU", "Random", "LRFU"], command=self._selecionar_algoritmo)
         self.combo_algo.set("FIFO")
         self.combo_algo.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(self.sidebar, text="Política de Escrita:", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(5, 2))
+        self.combo_write_policy = ctk.CTkComboBox(self.sidebar, values=["Write-Back", "Write-Through", OPCAO_COMPARAR])
+        self.combo_write_policy.set(OPCAO_COMPARAR)
+        self.combo_write_policy.pack(fill="x", pady=(0, 5))
+
+        self.check_flush = ctk.CTkCheckBox(self.sidebar, text="Contar flush final (Write-Back)", font=ctk.CTkFont(size=12))
+        self.check_flush.pack(anchor="w", pady=(0, 10))
 
         # Padrão de Carga
         ctk.CTkLabel(self.sidebar, text="Padrão de Acesso & Carga", font=ctk.CTkFont(size=12, weight="bold"), text_color="#a0a0a0").pack(anchor="w", pady=(10, 2))
@@ -298,6 +438,7 @@ class CacheSimulatorApp(ctk.CTk):
         self.entry_prob_temp = self._add_stepper_field(self.sidebar, "Prob. Temporal:", "0.20", step=0.05, is_float=True)
         self.entry_prob_esp = self._add_stepper_field(self.sidebar, "Prob. Espacial:", "0.20", step=0.05, is_float=True)
         self.entry_prob_hot = self._add_stepper_field(self.sidebar, "Prob. Hot Regions:", "0.40", step=0.05, is_float=True)
+        self.entry_prob_write = self._add_stepper_field(self.sidebar, "Prob. Escrita:", "0.15", step=0.05, is_float=True)
 
         # Blocos Analisados (Container Dinâmico)
         self.lbl_blocos_title = ctk.CTkLabel(self.sidebar, text="Blocos Analisados (Bytes):", font=ctk.CTkFont(size=12, weight="bold"), text_color="#a0a0a0")
@@ -356,7 +497,7 @@ class CacheSimulatorApp(ctk.CTk):
         self.tabview = ctk.CTkTabview(self.dashboard, command=self.on_tab_change)
         self.tabview.pack(fill="both", expand=True)
 
-        self.tab_plot = self.tabview.add(" Curva de Desempenho (Hit Rate)")
+        self.tab_plot = self.tabview.add(" Desempenho (Hit Rate & Escritas RAM)")
         self.tab_console = self.tabview.add(" Console Serial & Dados")
         self.tab_heatmap = self.tabview.add(" Ferramentas Visuais (Heatmap)")
         self.tab_diagram = self.tabview.add(" Diagrama em Blocos")
@@ -441,7 +582,8 @@ class CacheSimulatorApp(ctk.CTk):
         return card
 
     def _setup_tab_plot(self):
-        self.fig_plot, self.ax_plot = plt.subplots(figsize=(8, 4.5), dpi=100)
+        # Dois gráficos empilhados: hit rate (em cima) e escritas na RAM (embaixo)
+        self.fig_plot, (self.ax_plot, self.ax_writes) = plt.subplots(2, 1, figsize=(8, 5.4), dpi=100)
         self._setup_ax_plot_style()
 
         self.canvas_plot = FigureCanvasTkAgg(self.fig_plot, master=self.tab_plot)
@@ -452,17 +594,29 @@ class CacheSimulatorApp(ctk.CTk):
 
     def _setup_ax_plot_style(self):
         self.fig_plot.patch.set_facecolor('#1e1e2e')
-        self.ax_plot.set_facecolor('#1e1e2e')
-        self.ax_plot.tick_params(colors='white')
-        self.ax_plot.xaxis.label.set_color('white')
-        self.ax_plot.yaxis.label.set_color('white')
-        self.ax_plot.title.set_color('#00c8ff')
-        for spine in self.ax_plot.spines.values():
-            spine.set_color('#333d52')
-        self.ax_plot.set_xlabel("Tamanho do Bloco (log2 Bytes)")
-        self.ax_plot.set_ylabel("Taxa de Acerto (Hit Rate)")
-        self.ax_plot.set_title("Taxa de Acerto vs Tamanho do Bloco (Escala Log2)")
-        self.ax_plot.grid(True, linestyle='--', alpha=0.2, color='#ffffff')
+        configuracao = [
+            (self.ax_plot, "Taxa de Acerto (Hit Rate)", "Taxa de Acerto vs Tamanho do Bloco (Escala Log2)"),
+            (self.ax_writes, "Escritas na RAM (média)", "Escritas na RAM vs Tamanho do Bloco (Escala Log2)"),
+        ]
+        for ax, ylabel, titulo in configuracao:
+            ax.set_facecolor('#1e1e2e')
+            ax.tick_params(colors='white')
+            for spine in ax.spines.values():
+                spine.set_color('#333d52')
+            ax.set_xlabel("Tamanho do Bloco (log2 Bytes)", color='white')
+            ax.set_ylabel(ylabel, color='white')
+            ax.set_title(titulo, color='#00c8ff', fontsize=10)
+            ax.grid(True, linestyle='--', alpha=0.2, color='#ffffff')
+        self.fig_plot.tight_layout()
+
+    def _atualizar_legendas(self):
+        for ax in (self.ax_plot, self.ax_writes):
+            if ax.get_lines():
+                ax.legend(facecolor='#2b2b36', edgecolor='white', labelcolor='white', fontsize=8)
+            else:
+                legenda = ax.get_legend()
+                if legenda:
+                    legenda.remove()
 
     def _setup_tab_console(self):
         lbl1 = ctk.CTkLabel(self.tab_console, text="Saída do Console da CPU / Logs em Tempo Real:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#a0a0a0")
@@ -693,6 +847,8 @@ class CacheSimulatorApp(ctk.CTk):
             prob_temporal = float(self.entry_prob_temp.get())
             prob_espacial = float(self.entry_prob_esp.get())
             prob_quente = float(self.entry_prob_hot.get())
+            prob_escrita = float(self.entry_prob_write.get())
+            flush_final = bool(self.check_flush.get())
             blocos_raw = self.entry_blocos_multi.get()
             blocos = [int(b.strip()) for b in blocos_raw.split(",")]
 
@@ -713,7 +869,25 @@ class CacheSimulatorApp(ctk.CTk):
                 self.card_status.label_val.configure(text="Status: Erro de Entrada")
                 return
 
-            self.resultados.clear()
+            if acessos < 1 or n_simulacoes < 1:
+                self.lbl_msg_erro.configure(text="[ERRO] Acessos CPU e Simulações MC devem ser pelo menos 1.")
+                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+                return
+
+            if prob_temporal + prob_espacial + prob_quente > 1.0 + 1e-9:
+                self.lbl_msg_erro.configure(text="[ERRO] Prob. Temporal + Espacial + Hot Regions não pode passar de 1.")
+                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+                return
+
+            if not (0.0 <= prob_escrita <= 1.0):
+                self.lbl_msg_erro.configure(text="[ERRO] Prob. Escrita deve estar entre 0 e 1.")
+                self.card_status.label_val.configure(text="Status: Erro de Entrada")
+                return
+
+            politica_ui = self.combo_write_policy.get()
+            politicas = list(POLITICAS_ESCRITA) if politica_ui == OPCAO_COMPARAR else [politica_ui]
+
+            self.resultados = {p: [] for p in politicas}
             contador_barra = 0
             self.progressbar.set(0.01)
             self.update_idletasks()
@@ -726,49 +900,83 @@ class CacheSimulatorApp(ctk.CTk):
                     self.lbl_msg_erro.configure(text=f"[ERRO] Bloco {bt} inválido. Use potências de 2.")
                     self.card_status.label_val.configure(text="Status: Erro de Entrada")
                     return
-                
+
+                if tamanho_cache_bytes // bt // associatividade < 1:
+                    self.lbl_msg_erro.configure(
+                        text=f"[ERRO] Bloco {bt} B com cache de {tamanho_cache_bytes} B e {associatividade} vias "
+                             f"gera 0 conjuntos. Aumente a cache ou reduza bloco/associatividade.")
+                    self.card_status.label_val.configure(text="Status: Erro de Entrada")
+                    return
+
                 contador_barra += 1
                 progresso = contador_barra / len(blocos)
 
-                taxa_acerto = simulacao_monte_carlo(
+                por_politica = simulacao_monte_carlo_com_escritas(
                     n_simulacoes, acessos, memory_size, tamanho_cache_bytes,
                     associatividade, regioes_quentes, (prob_temporal, prob_espacial, prob_quente),
-                    bt, self.algoritmo_escolhido
+                    bt, self.algoritmo_escolhido, politicas, prob_escrita, flush_final
                 )
 
                 if not self.is_running:
                     return
 
+                for politica, (taxa_acerto, total_ram_w) in por_politica.items():
+                    self.resultados[politica].append((bt, taxa_acerto, total_ram_w))
+
                 self.progressbar.set(progresso)
-                self.resultados.append((bt, taxa_acerto))
                 self.update_idletasks()
 
             self.atualizar_plot()
             self.desenhar_diagrama_blocos()
 
             if self.resultados and self.is_running:
-                tamanhos, taxas = zip(*self.resultados)
-                max_hit = max(taxas)
+                todas_as_taxas = [taxa for linhas in self.resultados.values() for (_, taxa, _) in linhas]
+                max_hit = max(todas_as_taxas)
 
                 self.card_hit.label_val.configure(text=f"Hit Rate Máx: {max_hit*100:.2f}%")
                 self.card_status.label_val.configure(text=f"Status: Concluído ({time.time() - start_time:.2f}s)")
 
-                texto = f"// RESULTADOS SIMULAÇÃO ({self.algoritmo_escolhido})\n"
-                texto += f"Tamanhos_de_bloco = [{', '.join(str(int(t)) for t in tamanhos)}];\n"
-                texto += f"Taxa_media_de_acerto = [{', '.join(f'{float(t):.6f}' for t in taxas)}];"
-                
+                # Painel de resultados: um bloco de arrays por política de escrita
+                flush_txt = "sim" if flush_final else "não"
+                texto = ""
+                for politica, linhas in self.resultados.items():
+                    tamanhos, taxas, ram_writes_list = zip(*linhas)
+                    texto += (f"// {self.algoritmo_escolhido} | {politica} | "
+                              f"%WRITE={prob_escrita * 100:.0f} | flush final: {flush_txt}\n")
+                    texto += f"Tamanhos_de_bloco = [{', '.join(str(int(t)) for t in tamanhos)}];\n"
+                    texto += f"Taxa_media_de_acerto = [{', '.join(f'{float(t):.6f}' for t in taxas)}];\n"
+                    texto += f"Escritas_Totais_RAM = [{', '.join(f'{float(w):.1f}' for w in ram_writes_list)}];\n\n"
+
+                if "Write-Back" in self.resultados and "Write-Through" in self.resultados:
+                    escritas_wb = [w for (_, _, w) in self.resultados["Write-Back"]]
+                    escritas_wt = [w for (_, _, w) in self.resultados["Write-Through"]]
+                    reducao = [(1 - wb / wt) * 100 if wt > 0 else 0.0 for wb, wt in zip(escritas_wb, escritas_wt)]
+                    texto += "// Redução de escritas do Write-Back em relação ao Write-Through (%)\n"
+                    texto += f"Reducao_WB_vs_WT_pct = [{', '.join(f'{r:.2f}' for r in reducao)}];"
+
                 self.textbox_resultados.configure(state="normal")
                 self.textbox_resultados.delete("1.0", "end")
-                self.textbox_resultados.insert("1.0", texto)
+                self.textbox_resultados.insert("1.0", texto.rstrip())
                 self.textbox_resultados.configure(state="disabled")
 
+                # CSV com os parâmetros da execução em cada linha (facilita reproduzir e plotar depois)
                 os.makedirs("Resultados_Simulacao", exist_ok=True)
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                caminho_arquivo = os.path.join("Resultados_Simulacao", f"Simulacao_{timestamp}.csv")
-                with open(caminho_arquivo, "w") as f:
-                    f.write("Tamanho_Bloco,Taxa_Acerto\n")
-                    for bloco, taxa in self.resultados:
-                        f.write(f"{bloco},{taxa:.6f}\n")
+                if len(politicas) == 2:
+                    tag = "WBxWT"
+                else:
+                    tag = "WB" if politicas[0] == "Write-Back" else "WT"
+                caminho_arquivo = os.path.join(
+                    "Resultados_Simulacao", f"Simulacao_{self.algoritmo_escolhido}_{tag}_{timestamp}.csv")
+                with open(caminho_arquivo, "w", encoding="utf-8") as f:
+                    f.write("Algoritmo,Politica_Escrita,Prob_Escrita,Flush_Final,Cache_Bytes,Associatividade,"
+                            "Acessos,Simulacoes,Tamanho_Bloco,Taxa_Acerto,Escritas_RAM\n")
+                    for politica, linhas in self.resultados.items():
+                        for bloco, taxa, ram_w in linhas:
+                            f.write(f"{self.algoritmo_escolhido},{politica},{prob_escrita:.2f},{int(flush_final)},"
+                                    f"{tamanho_cache_bytes},{associatividade},{acessos},{n_simulacoes},"
+                                    f"{bloco},{taxa:.6f},{ram_w:.1f}\n")
+                print(f"[CSV] Resultados salvos em {caminho_arquivo}")
 
         except Exception as e:
             if self.is_running:
@@ -778,13 +986,24 @@ class CacheSimulatorApp(ctk.CTk):
     def atualizar_plot(self):
         if not self.resultados or not self.is_running:
             return
-        tamanhos, taxas = zip(*self.resultados)
-        tamanhos_log2 = [math.log2(tam) for tam in tamanhos]
 
-        line, = self.ax_plot.plot(tamanhos_log2, taxas, marker='o', linewidth=2, label=self.algoritmo_escolhido)
-        self.plot_lines.append(line)
+        grupo = []  # linhas desta execução (uma por política), para o "Limpar Último" remover juntas
+        for politica, linhas in self.resultados.items():
+            tamanhos, taxas, escritas = zip(*linhas)
+            tamanhos_log2 = [math.log2(tam) for tam in tamanhos]
+            rotulo = f"{self.algoritmo_escolhido} ({politica})"
+            estilo, marcador = ESTILO_POLITICA.get(politica, ("-", "o"))
 
-        self.ax_plot.legend(facecolor='#2b2b36', edgecolor='white', labelcolor='white')
+            linha_hit, = self.ax_plot.plot(
+                tamanhos_log2, taxas, linestyle=estilo, marker=marcador, linewidth=2, label=rotulo)
+            linha_wr, = self.ax_writes.plot(
+                tamanhos_log2, escritas, linestyle=estilo, marker=marcador, linewidth=2,
+                color=linha_hit.get_color(), label=rotulo)
+            grupo.append((linha_hit, linha_wr))
+
+        self.plot_lines.append(grupo)
+        self._atualizar_legendas()
+        self.fig_plot.tight_layout()
         self.canvas_plot.draw()
 
     def limpar_ultimo_plot(self):
@@ -796,19 +1015,16 @@ class CacheSimulatorApp(ctk.CTk):
         self.textbox_resultados.configure(state="disabled")
 
         if self.plot_lines:
-            line = self.plot_lines.pop()
-            line.remove()
-            if self.plot_lines:
-                self.ax_plot.legend(facecolor='#2b2b36', edgecolor='white', labelcolor='white')
-            else:
-                legend = self.ax_plot.get_legend()
-                if legend:
-                    legend.remove()
+            for linha_hit, linha_wr in self.plot_lines.pop():
+                linha_hit.remove()
+                linha_wr.remove()
+            self._atualizar_legendas()
             self.canvas_plot.draw()
 
     def limpar_plots(self):
         self.plot_lines.clear()
         self.ax_plot.clear()
+        self.ax_writes.clear()
         self._setup_ax_plot_style()
         self.canvas_plot.draw()
 
